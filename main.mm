@@ -5,6 +5,7 @@
 #import <Cocoa/Cocoa.h>
 
 static const int64_t SYNTHETIC_MARKER = 0xC0DECAFE;
+static const bool EXPERIMENTAL_CMD2CTRL = true;
 
 // <IOKit/hidsystem/IOLLEvent.h> as NX_DEVICE* KEYMASK.
 static const uint64_t LCTRL_MASK = 0x00000001;
@@ -122,6 +123,24 @@ static NSScreen* ScreenForWindow(const AXUIElementRef win) {
     return [NSScreen mainScreen];
 }
 
+static CGRect DefaultFrameForScreen(NSScreen* const screen) {
+    const CGRect sf = AxFrameForScreen(screen);
+    const CGFloat w = floor(sf.size.width*  0.6);
+    const CGFloat h = floor(sf.size.height*  0.7);
+
+    return CGRectMake(sf.origin.x + floor((sf.size.width - w) / 2.0), sf.origin.y + floor((sf.size.height - h) / 2.0), w, h);
+}
+
+static bool IsFilled(const AXUIElementRef win) {
+    CGRect rect;
+    if (!GetWinFrame(win, &rect)) {
+        return false;
+    }
+
+    const CGRect sf = AxFrameForScreen(ScreenForWindow(win));
+    return fabs(rect.origin.y - sf.origin.y) < 20 && fabs(rect.size.height - sf.size.height) < 20;
+}
+
 static void TileTo(const CGFloat fracX, const CGFloat fracW) {
     const AXUIElementRef win = FocusedWindow();
     if (!win) {
@@ -150,13 +169,18 @@ static void Maximize() {
 }
 
 
-static void Minimize() {
+static void RestoreOrMinimize() {
     const AXUIElementRef win = FocusedWindow();
     if (!win) {
         return;
     }
 
-    AXUIElementSetAttributeValue(win, kAXMinimizedAttribute, kCFBooleanTrue);
+    if (IsFilled(win)) {
+        SetWinFrame(win, DefaultFrameForScreen(ScreenForWindow(win)));
+    } else {
+        AXUIElementSetAttributeValue(win, kAXMinimizedAttribute, kCFBooleanTrue);
+    }
+
     CFRelease(win);
 }
 
@@ -298,6 +322,17 @@ static CGEventRef Handler(const CGEventTapProxy proxy, const CGEventType type, c
         if (win) {
             CGRect rect;
             if (GetWinFrame(win, &rect)) {
+                if (IsFilled(win)) {
+                    CGRect def = DefaultFrameForScreen(ScreenForWindow(win));
+
+                    const CGFloat fx = (rect.size.width > 0) ? (loc.x - rect.origin.x) / rect.size.width : 0.5;
+                    def.origin.x = loc.x - floor(fx*  def.size.width);
+                    def.origin.y = loc.y - 10;
+
+                    SetWinFrame(win, def);
+                    rect = def;
+                }
+
                 isDragging = true;
                 dragWin = win;
                 dragStartMouse = loc;
@@ -417,6 +452,13 @@ static CGEventRef Handler(const CGEventTapProxy proxy, const CGEventType type, c
             case kVK_Delete:
                 CGEventSetFlags(event, noCtrl | kCGEventFlagMaskAlternate | LOPT_MASK);
                 return event;
+            case kVK_Tab:
+                return event;
+        }
+
+        if (EXPERIMENTAL_CMD2CTRL) {
+            CGEventSetFlags(event, noCtrl | kCGEventFlagMaskCommand | LCMD_MASK);
+            return event;
         }
     }
 
@@ -453,7 +495,7 @@ static CGEventRef Handler(const CGEventTapProxy proxy, const CGEventType type, c
                 return NULL;
             case kVK_DownArrow:
                 if (down) {
-                    Minimize();
+                    RestoreOrMinimize();
                 }
                 return NULL;
             case kVK_LeftArrow:
