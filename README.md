@@ -64,3 +64,4 @@ Uninstall: `./uninstall.sh`.
 
  - Lightly inspired by (= blatantly copied from) the Karabiner open-source project, at least the use of the accessibility API to re-route shortcuts.
 
+ - `EXPERIMENTAL_CMD2CTRL` defaults to true, will break compatibility in apps where ctrl+key and cmd+key have conflicts. Set to false if not wanted.
