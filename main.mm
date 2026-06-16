@@ -31,6 +31,10 @@ static AXUIElementRef dragWin = NULL;
 static CGPoint dragStartMouse;
 static CGPoint dragStartWinPos;
 
+// right option is context menu
+static bool rightOptionDown = false;
+static bool rightOptionChorded = false;
+
 typedef enum {
     DragTileNone = 0,
     DragTileFill,
@@ -55,10 +59,322 @@ static void PostKey(const CGKeyCode k, const CGEventFlags flags) {
     CFRelease(u);
 }
 
+static CGEventFlags FlagsWithoutRightOption(CGEventFlags flags) {
+    flags &= ~ROPT_MASK;
+    if ((flags & LOPT_MASK) == 0) {
+        flags &= ~kCGEventFlagMaskAlternate;
+    }
+
+    return flags;
+}
+
+static bool HasModifierOtherThanRightOption(const CGEventFlags flags) {
+    const CGEventFlags f = FlagsWithoutRightOption(flags);
+    const CGEventFlags mods = kCGEventFlagMaskControl | kCGEventFlagMaskCommand | kCGEventFlagMaskAlternate | kCGEventFlagMaskShift |
+        LCTRL_MASK | RCTRL_MASK | LCMD_MASK | RCMD_MASK | LOPT_MASK | LSHIFT_MASK | RSHIFT_MASK;
+
+    return (f & mods) != 0;
+}
+
+static CGPoint CurrentMouseLocation() {
+    const CGEventRef cur = CGEventCreate(NULL);
+    if (!cur) {
+        return CGPointZero;
+    }
+
+    const CGPoint loc = CGEventGetLocation(cur);
+    CFRelease(cur);
+    return loc;
+}
+
+static void PostRightClickAt(const CGPoint loc) {
+    const CGEventRef d = CGEventCreateMouseEvent(eventSrc, kCGEventRightMouseDown, loc, kCGMouseButtonRight);
+    const CGEventRef u = CGEventCreateMouseEvent(eventSrc, kCGEventRightMouseUp, loc, kCGMouseButtonRight);
+
+    if (!d || !u) {
+        if (d) {
+            CFRelease(d);
+        }
+        if (u) {
+            CFRelease(u);
+        }
+        return;
+    }
+
+    CGEventSetFlags(d, 0);
+    CGEventSetFlags(u, 0);
+    CGEventSetIntegerValueField(d, kCGEventSourceUserData, SYNTHETIC_MARKER);
+    CGEventSetIntegerValueField(u, kCGEventSourceUserData, SYNTHETIC_MARKER);
+    CGEventSetIntegerValueField(d, kCGMouseEventButtonNumber, kCGMouseButtonRight);
+    CGEventSetIntegerValueField(u, kCGMouseEventButtonNumber, kCGMouseButtonRight);
+    CGEventSetIntegerValueField(d, kCGMouseEventClickState, 1);
+    CGEventSetIntegerValueField(u, kCGMouseEventClickState, 1);
+
+    CGEventPost(kCGHIDEventTap, d);
+    CGEventPost(kCGHIDEventTap, u);
+
+    CFRelease(d);
+    CFRelease(u);
+}
+
 static void SetAXTimeout(const AXUIElementRef el) {
     if (el) {
         AXUIElementSetMessagingTimeout(el, AX_MESSAGE_TIMEOUT);
     }
+}
+
+static bool IsUsableTextBounds(const CGRect rect, const bool requireWidth) {
+    if (CGRectIsNull(rect)) {
+        return false;
+    }
+
+    if (rect.size.height <= 0.0 || rect.size.width < 0.0) {
+        return false;
+    }
+
+    if (requireWidth && rect.size.width <= 0.0) {
+        return false;
+    }
+
+    return true;
+}
+
+static CGPoint PointInsideTextBounds(const CGRect rect) {
+    const CGFloat xInset = rect.size.width > 2.0 ? floor(rect.size.width / 2.0) : 1.0;
+    const CGFloat yInset = rect.size.height > 2.0 ? floor(rect.size.height / 2.0) : 1.0;
+    return CGPointMake(rect.origin.x + xInset, rect.origin.y + yInset);
+}
+
+static bool CopySelectedTextRange(const AXUIElementRef el, CFRange* const out) {
+    if (!el || !out) {
+        return false;
+    }
+
+    CFTypeRef value = NULL;
+    AXError err = AXUIElementCopyAttributeValue(el, kAXSelectedTextRangeAttribute, &value);
+    if (err == kAXErrorSuccess && value) {
+        const bool ok = CFGetTypeID(value) == AXValueGetTypeID() &&
+                        AXValueGetType((AXValueRef)value) == kAXValueTypeCFRange &&
+                        AXValueGetValue((AXValueRef)value, kAXValueTypeCFRange, out);
+        CFRelease(value);
+        return ok && out->location >= 0 && out->length >= 0;
+    }
+
+    if (value) {
+        CFRelease(value);
+    }
+
+    CFTypeRef rangesValue = NULL;
+    err = AXUIElementCopyAttributeValue(el, CFSTR("AXSelectedTextRanges"), &rangesValue);
+    if (err != kAXErrorSuccess || !rangesValue) {
+        return false;
+    }
+
+    if (CFGetTypeID(rangesValue) != CFArrayGetTypeID() || CFArrayGetCount((CFArrayRef)rangesValue) == 0) {
+        CFRelease(rangesValue);
+        return false;
+    }
+
+    CFTypeRef first = CFArrayGetValueAtIndex((CFArrayRef)rangesValue, 0);
+    const bool ok = first &&
+                    CFGetTypeID(first) == AXValueGetTypeID() &&
+                    AXValueGetType((AXValueRef)first) == kAXValueTypeCFRange &&
+                    AXValueGetValue((AXValueRef)first, kAXValueTypeCFRange, out);
+
+    CFRelease(rangesValue);
+    return ok && out->location >= 0 && out->length >= 0;
+}
+
+static bool CopyBoundsForTextRange(const AXUIElementRef el, const CFRange range, CGRect* const out) {
+    if (!el || !out || range.location < 0 || range.length < 0) {
+        return false;
+    }
+
+    const AXValueRef param = AXValueCreate(kAXValueTypeCFRange, &range);
+    if (!param) {
+        return false;
+    }
+
+    CFTypeRef value = NULL;
+    const AXError err = AXUIElementCopyParameterizedAttributeValue(el, kAXBoundsForRangeParameterizedAttribute, param, &value);
+    CFRelease(param);
+
+    if (err != kAXErrorSuccess || !value) {
+        return false;
+    }
+
+    const bool ok = CFGetTypeID(value) == AXValueGetTypeID() &&
+                    AXValueGetType((AXValueRef)value) == kAXValueTypeCGRect &&
+                    AXValueGetValue((AXValueRef)value, kAXValueTypeCGRect, out);
+    CFRelease(value);
+    return ok;
+}
+
+static bool CopyStringForTextRange(const AXUIElementRef el, const CFRange range, CFStringRef* const out) {
+    if (!el || !out || range.location < 0 || range.length < 0) {
+        return false;
+    }
+
+    *out = NULL;
+
+    const AXValueRef param = AXValueCreate(kAXValueTypeCFRange, &range);
+    if (!param) {
+        return false;
+    }
+
+    CFTypeRef value = NULL;
+    const AXError err = AXUIElementCopyParameterizedAttributeValue(el, CFSTR("AXStringForRange"), param, &value);
+    CFRelease(param);
+
+    if (err != kAXErrorSuccess || !value) {
+        return false;
+    }
+
+    if (CFGetTypeID(value) != CFStringGetTypeID()) {
+        CFRelease(value);
+        return false;
+    }
+
+    *out = (CFStringRef)value;
+    return true;
+}
+
+static bool CFStringIsWhitespaceOnly(const CFStringRef str) {
+    if (!str) {
+        return true;
+    }
+
+    const CFIndex len = CFStringGetLength(str);
+    if (len == 0) {
+        return true;
+    }
+
+    const CFCharacterSetRef ws = CFCharacterSetGetPredefined(kCFCharacterSetWhitespaceAndNewline);
+    for (CFIndex ii = 0; ii < len; ii++) {
+        if (!CFCharacterSetIsCharacterMember(ws, CFStringGetCharacterAtIndex(str, ii))) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static bool CopyPreviousNonWhitespaceBounds(const AXUIElementRef el, const CFIndex location, CGRect* const out) {
+    if (!el || !out || location <= 0) {
+        return false;
+    }
+
+    const CFIndex maxLookbehind = 64;
+    for (CFIndex offset = 1; offset <= maxLookbehind && location - offset >= 0; offset++) {
+        const CFRange candidate = CFRangeMake(location - offset, 1);
+        CFStringRef text = NULL;
+        const bool haveText = CopyStringForTextRange(el, candidate, &text);
+
+        if (haveText) {
+            const bool whitespace = CFStringIsWhitespaceOnly(text);
+            CFRelease(text);
+            if (whitespace) {
+                continue;
+            }
+        } else if (offset > 1) {
+            return false;
+        }
+
+        if (CopyBoundsForTextRange(el, candidate, out) && IsUsableTextBounds(*out, true)) {
+            return true;
+        }
+
+        if (!haveText) {
+            return false;
+        }
+    }
+
+    return false;
+}
+
+static bool TextContextPointForElement(const AXUIElementRef el, CGPoint* const out) {
+    if (!el || !out) {
+        return false;
+    }
+
+    SetAXTimeout(el);
+
+    CFRange selected;
+    if (!CopySelectedTextRange(el, &selected)) {
+        return false;
+    }
+
+    CGRect bounds = CGRectZero;
+
+    if (selected.length > 0) {
+        if (CopyBoundsForTextRange(el, selected, &bounds) && IsUsableTextBounds(bounds, false)) {
+            *out = PointInsideTextBounds(bounds);
+            return true;
+        }
+
+        const CFRange firstChar = CFRangeMake(selected.location, 1);
+        if (CopyBoundsForTextRange(el, firstChar, &bounds) && IsUsableTextBounds(bounds, true)) {
+            *out = PointInsideTextBounds(bounds);
+            return true;
+        }
+    } else {
+        if (CopyPreviousNonWhitespaceBounds(el, selected.location, &bounds)) {
+            *out = PointInsideTextBounds(bounds);
+            return true;
+        }
+
+        if (CopyBoundsForTextRange(el, selected, &bounds) && IsUsableTextBounds(bounds, false)) {
+            *out = PointInsideTextBounds(bounds);
+            return true;
+        }
+
+        const CFRange nextChar = CFRangeMake(selected.location, 1);
+        if (CopyBoundsForTextRange(el, nextChar, &bounds) && IsUsableTextBounds(bounds, true)) {
+            *out = PointInsideTextBounds(bounds);
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static bool CurrentTextContextPoint(CGPoint* const out) {
+    if (!out) {
+        return false;
+    }
+
+    const AXUIElementRef sw = AXUIElementCreateSystemWide();
+    SetAXTimeout(sw);
+
+    AXUIElementRef cur = NULL;
+    const AXError err = AXUIElementCopyAttributeValue(sw, kAXFocusedUIElementAttribute, (CFTypeRef* )&cur);
+    CFRelease(sw);
+
+    if (err != kAXErrorSuccess || !cur) {
+        return false;
+    }
+
+    for (int depth = 0; cur && depth < 8; depth++) {
+        SetAXTimeout(cur);
+        if (TextContextPointForElement(cur, out)) {
+            CFRelease(cur);
+            return true;
+        }
+
+        AXUIElementRef parent = NULL;
+        AXUIElementCopyAttributeValue(cur, kAXParentAttribute, (CFTypeRef* )&parent);
+        SetAXTimeout(parent);
+        CFRelease(cur);
+        cur = parent;
+    }
+
+    return false;
+}
+
+static void OpenContextMenuAtBestPoint(const CGPoint fallbackPoint) {
+    CGPoint point = fallbackPoint;
+    CurrentTextContextPoint(&point);
+    PostRightClickAt(point);
 }
 
 static bool IsAXWindow(const AXUIElementRef el) {
@@ -516,16 +832,69 @@ static CGEventRef Handler(const CGEventTapProxy proxy, const CGEventType type, c
         return event;
     }
 
-    const CGEventFlags flags = CGEventGetFlags(event);
+    CGEventFlags flags = CGEventGetFlags(event);
+    const bool keyboardish = type == kCGEventKeyDown || type == kCGEventKeyUp || type == kCGEventFlagsChanged;
+    const CGKeyCode kc = keyboardish ? (CGKeyCode)CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode) : 0;
+
+    if (type == kCGEventFlagsChanged) {
+        if (kc == kVK_RightOption) {
+            const bool nowDown = (flags & ROPT_MASK) != 0;
+            if (nowDown) {
+                rightOptionDown = true;
+                rightOptionChorded = HasModifierOtherThanRightOption(flags);
+            } else {
+                const bool shouldOpenContextMenu = rightOptionDown && !rightOptionChorded;
+                rightOptionDown = false;
+                rightOptionChorded = false;
+
+                if (shouldOpenContextMenu) {
+                    const CGPoint fallbackPoint = CurrentMouseLocation();
+                    dispatch_async(winQueue, ^{ @autoreleasepool { OpenContextMenuAtBestPoint(fallbackPoint); } });
+                }
+            }
+
+            return NULL;
+        }
+
+        if (rightOptionDown) {
+            rightOptionChorded = true;
+            flags = FlagsWithoutRightOption(flags);
+            CGEventSetFlags(event, flags);
+        }
+    } else if (rightOptionDown) {
+        switch (type) {
+            case kCGEventKeyDown:
+            case kCGEventKeyUp:
+            case kCGEventLeftMouseDown:
+            case kCGEventLeftMouseUp:
+            case kCGEventLeftMouseDragged:
+                rightOptionChorded = true;
+                break;
+            default:
+                break;
+        }
+
+        flags = FlagsWithoutRightOption(flags);
+        CGEventSetFlags(event, flags);
+    }
+
+    if ((flags & ROPT_MASK) != 0) {
+        flags = FlagsWithoutRightOption(flags);
+        CGEventSetFlags(event, flags);
+    }
+
     const bool ctrl = flags & kCGEventFlagMaskControl;
     const bool cmd = flags & kCGEventFlagMaskCommand;
     const bool opt = flags & kCGEventFlagMaskAlternate;
     const bool shift = flags & kCGEventFlagMaskShift;
     const bool lcmd = flags & LCMD_MASK;
     const bool rcmd = flags & RCMD_MASK;
+    const bool lopt = flags & LOPT_MASK;
+    const bool ropt = flags & ROPT_MASK;
+    const bool meta = lopt && !ropt;
 
     // meta + mouse drag
-    if (type == kCGEventLeftMouseDown && opt && !isDragging) {
+    if (type == kCGEventLeftMouseDown && meta && !isDragging) {
         const CGPoint loc = CGEventGetLocation(event);
         const AXUIElementRef win = WindowAtPoint(loc);
 
@@ -617,7 +986,6 @@ static CGEventRef Handler(const CGEventTapProxy proxy, const CGEventType type, c
         return event;
     }
 
-    const CGKeyCode kc = (CGKeyCode)CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode);
     const bool down = (type == kCGEventKeyDown);
     const bool repeat = down && CGEventGetIntegerValueField(event, kCGKeyboardEventAutorepeat) != 0;
 
@@ -719,7 +1087,7 @@ static CGEventRef Handler(const CGEventTapProxy proxy, const CGEventType type, c
     }
 
     // meta+Q
-    if (opt && !ctrl && !cmd && !shift && kc == kVK_ANSI_Q) {
+    if (meta && !ctrl && !cmd && !shift && kc == kVK_ANSI_Q) {
         const CGEventFlags base = flags & ~kCGEventFlagMaskAlternate & ~LOPT_MASK & ~ROPT_MASK;
         CGEventSetFlags(event, base | kCGEventFlagMaskCommand | LCMD_MASK);
 
@@ -727,7 +1095,7 @@ static CGEventRef Handler(const CGEventTapProxy proxy, const CGEventType type, c
     }
 
     // meta + window actions
-    if (opt && !ctrl && !cmd && !shift) {
+    if (meta && !ctrl && !cmd && !shift) {
         switch (kc) {
             case kVK_UpArrow:
                 if (down && !repeat) {
@@ -782,7 +1150,7 @@ static CGEventRef Handler(const CGEventTapProxy proxy, const CGEventType type, c
     }
 
     // meta+shift
-    if (opt && shift && !ctrl && !cmd) {
+    if (meta && shift && !ctrl && !cmd) {
         // rectangle screenshot to clipboard
         if (kc == kVK_ANSI_S) {
             if (down) {
@@ -817,7 +1185,12 @@ int main(const int argc, char* * const argv) {
         eventSrc = CGEventSourceCreate(kCGEventSourceStateHIDSystemState);
         winQueue = dispatch_queue_create("mocsd.window", DISPATCH_QUEUE_SERIAL);
 
-        const CGEventMask mask = CGEventMaskBit(kCGEventKeyDown) | CGEventMaskBit(kCGEventKeyUp) | CGEventMaskBit(kCGEventLeftMouseDown) | CGEventMaskBit(kCGEventLeftMouseUp) | CGEventMaskBit(kCGEventLeftMouseDragged);
+        const CGEventMask mask = CGEventMaskBit(kCGEventKeyDown) |
+                                 CGEventMaskBit(kCGEventKeyUp) |
+                                 CGEventMaskBit(kCGEventFlagsChanged) |
+                                 CGEventMaskBit(kCGEventLeftMouseDown) |
+                                 CGEventMaskBit(kCGEventLeftMouseUp) |
+                                 CGEventMaskBit(kCGEventLeftMouseDragged);
 
         tapSrc = CGEventTapCreate(kCGSessionEventTap, kCGHeadInsertEventTap, kCGEventTapOptionDefault, mask, Handler, NULL);
         if (!tapSrc) {
