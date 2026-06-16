@@ -6,6 +6,7 @@
 
 static const int64_t SYNTHETIC_MARKER = 0xC0DECAFE;
 static const bool EXPERIMENTAL_CMD2CTRL = true;
+static const float AX_MESSAGE_TIMEOUT = 1.0f;
 
 // <IOKit/hidsystem/IOLLEvent.h> as NX_DEVICE* KEYMASK.
 static const uint64_t LCTRL_MASK = 0x00000001;
@@ -19,6 +20,7 @@ static const uint64_t RCTRL_MASK = 0x00002000;
 
 static CFMachPortRef tapSrc = NULL;
 static CGEventSourceRef eventSrc = NULL;
+static dispatch_queue_t winQueue = NULL;
 
 // meta+drag
 static bool isDragging = false;
@@ -43,8 +45,99 @@ static void PostKey(const CGKeyCode k, const CGEventFlags flags) {
     CFRelease(u);
 }
 
+static void SetAXTimeout(const AXUIElementRef el) {
+    if (el) {
+        AXUIElementSetMessagingTimeout(el, AX_MESSAGE_TIMEOUT);
+    }
+}
+
+static bool IsAXWindow(const AXUIElementRef el) {
+    if (!el) {
+        return false;
+    }
+
+    CFStringRef role = NULL;
+    const AXError err = AXUIElementCopyAttributeValue(el, kAXRoleAttribute, (CFTypeRef* )&role);
+    if (err != kAXErrorSuccess || !role) {
+        return false;
+    }
+
+    const bool isWin = CFStringCompare(role, kAXWindowRole, 0) == kCFCompareEqualTo;
+    CFRelease(role);
+    return isWin;
+}
+
+static bool IsMinimizedWindow(const AXUIElementRef win) {
+    CFTypeRef value = NULL;
+    const AXError err = AXUIElementCopyAttributeValue(win, kAXMinimizedAttribute, &value);
+    if (err != kAXErrorSuccess || !value) {
+        return false;
+    }
+
+    const bool minimized = (CFGetTypeID(value) == CFBooleanGetTypeID()) && CFBooleanGetValue((CFBooleanRef)value);
+    CFRelease(value);
+    return minimized;
+}
+
+static AXUIElementRef CopyWindowAttribute(const AXUIElementRef app, const CFStringRef attr) {
+    AXUIElementRef win = NULL;
+    const AXError err = AXUIElementCopyAttributeValue(app, attr, (CFTypeRef* )&win);
+    if (err != kAXErrorSuccess || !win) {
+        return NULL;
+    }
+
+    SetAXTimeout(win);
+    if (!IsAXWindow(win)) {
+        CFRelease(win);
+        return NULL;
+    }
+
+    return win;
+}
+
+static AXUIElementRef CopyFirstAppWindow(const AXUIElementRef app, const bool allowMinimized) {
+    CFArrayRef windows = NULL;
+    const AXError err = AXUIElementCopyAttributeValue(app, kAXWindowsAttribute, (CFTypeRef* )&windows);
+    if (err != kAXErrorSuccess || !windows) {
+        return NULL;
+    }
+
+    if (CFGetTypeID(windows) != CFArrayGetTypeID()) {
+        CFRelease(windows);
+        return NULL;
+    }
+
+    const CFIndex count = CFArrayGetCount(windows);
+    for (CFIndex ii = 0; ii < count; ii++) {
+        AXUIElementRef win = (AXUIElementRef)CFArrayGetValueAtIndex(windows, ii);
+        if (!win) {
+            continue;
+        }
+
+        CFRetain(win);
+        SetAXTimeout(win);
+        if (!IsAXWindow(win)) {
+            CFRelease(win);
+            continue;
+        }
+
+        if (!allowMinimized && IsMinimizedWindow(win)) {
+            CFRelease(win);
+            continue;
+        }
+
+        CFRelease(windows);
+        return win;
+    }
+
+    CFRelease(windows);
+    return NULL;
+}
+
 static AXUIElementRef FocusedWindow() {
     const AXUIElementRef sw = AXUIElementCreateSystemWide();
+    SetAXTimeout(sw);
+
     AXUIElementRef app = NULL;
     const AXError err = AXUIElementCopyAttributeValue(sw, kAXFocusedApplicationAttribute, (CFTypeRef* )&app);
     CFRelease(sw);
@@ -52,14 +145,30 @@ static AXUIElementRef FocusedWindow() {
         return NULL;
     }
 
-    AXUIElementRef win = NULL;
-    AXUIElementCopyAttributeValue(app, kAXFocusedWindowAttribute, (CFTypeRef* )&win);
-    CFRelease(app);
+    SetAXTimeout(app);
 
+    AXUIElementRef win = CopyWindowAttribute(app, kAXFocusedWindowAttribute);
+    if (!win) {
+        win = CopyWindowAttribute(app, kAXMainWindowAttribute);
+    }
+    if (!win) {
+        win = CopyFirstAppWindow(app, false);
+    }
+    if (!win) {
+        win = CopyFirstAppWindow(app, true);
+    }
+
+    CFRelease(app);
     return win;
 }
 
 static bool GetWinFrame(const AXUIElementRef win, CGRect* const out) {
+    if (!win || !out) {
+        return false;
+    }
+
+    SetAXTimeout(win);
+
     AXValueRef pv = NULL;
     AXValueRef sv = NULL;
     if (AXUIElementCopyAttributeValue(win, kAXPositionAttribute, (CFTypeRef* )&pv) != kAXErrorSuccess) {
@@ -67,7 +176,7 @@ static bool GetWinFrame(const AXUIElementRef win, CGRect* const out) {
     }
 
     if (AXUIElementCopyAttributeValue(win, kAXSizeAttribute, (CFTypeRef* )&sv) != kAXErrorSuccess) {
-    CFRelease(pv);
+        CFRelease(pv);
         return false;
     }
 
@@ -83,18 +192,31 @@ static bool GetWinFrame(const AXUIElementRef win, CGRect* const out) {
     return true;
 }
 
-static void SetWinFrame(const AXUIElementRef win, const CGRect rect) {
+static bool SetWinFrame(const AXUIElementRef win, const CGRect rect) {
+    if (!win) {
+        return false;
+    }
+
+    SetAXTimeout(win);
+
+    AXUIElementSetAttributeValue(win, kAXMinimizedAttribute, kCFBooleanFalse);
+    AXUIElementSetAttributeValue(win, CFSTR("AXFullScreen"), kCFBooleanFalse);
+    AXUIElementPerformAction(win, kAXRaiseAction);
+
     const CGPoint pp = rect.origin;
     const CGSize s = rect.size;
 
     const AXValueRef pv = AXValueCreate(kAXValueTypeCGPoint, &pp);
     const AXValueRef sv = AXValueCreate(kAXValueTypeCGSize, &s);
 
-    AXUIElementSetAttributeValue(win, kAXPositionAttribute, pv);
-    AXUIElementSetAttributeValue(win, kAXSizeAttribute, sv);
+    const AXError sizeErr1 = AXUIElementSetAttributeValue(win, kAXSizeAttribute, sv);
+    const AXError posErr = AXUIElementSetAttributeValue(win, kAXPositionAttribute, pv);
+    const AXError sizeErr2 = AXUIElementSetAttributeValue(win, kAXSizeAttribute, sv);
 
     CFRelease(pv);
     CFRelease(sv);
+
+    return posErr == kAXErrorSuccess && (sizeErr1 == kAXErrorSuccess || sizeErr2 == kAXErrorSuccess);
 }
 
 static CGRect AxFrameForScreen(NSScreen* const screen) {
@@ -186,14 +308,16 @@ static void RestoreOrMinimize() {
 
 static AXUIElementRef WindowAtPoint(const CGPoint point) {
     const AXUIElementRef sw = AXUIElementCreateSystemWide();
-    AXUIElementRef el = NULL;
+    SetAXTimeout(sw);
 
+    AXUIElementRef el = NULL;
     AXUIElementCopyElementAtPosition(sw, (float)point.x, (float)point.y, &el);
     CFRelease(sw);
     if (!el) {
         return NULL;
     }
 
+    SetAXTimeout(el);
     AXUIElementRef cur = el;
     CFRetain(cur);
     while (cur) {
@@ -210,6 +334,7 @@ static AXUIElementRef WindowAtPoint(const CGPoint point) {
 
         AXUIElementRef parent = NULL;
         AXUIElementCopyAttributeValue(cur, kAXParentAttribute, (CFTypeRef* )&parent);
+        SetAXTimeout(parent);
         CFRelease(cur);
         cur = parent;
     }
@@ -379,6 +504,7 @@ static CGEventRef Handler(const CGEventTapProxy proxy, const CGEventType type, c
 
     const CGKeyCode kc = (CGKeyCode)CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode);
     const bool down = (type == kCGEventKeyDown);
+    const bool repeat = down && CGEventGetIntegerValueField(event, kCGKeyboardEventAutorepeat) != 0;
 
     // right-cmd alone -> AltGr
     if (rcmd && !lcmd && !ctrl && !opt) {
@@ -489,23 +615,23 @@ static CGEventRef Handler(const CGEventTapProxy proxy, const CGEventType type, c
     if (opt && !ctrl && !cmd && !shift) {
         switch (kc) {
             case kVK_UpArrow:
-                if (down) {
-                    Maximize();
+                if (down && !repeat) {
+                    dispatch_async(winQueue, ^{ @autoreleasepool { Maximize(); } });
                 }
                 return NULL;
             case kVK_DownArrow:
-                if (down) {
-                    RestoreOrMinimize();
+                if (down && !repeat) {
+                    dispatch_async(winQueue, ^{ @autoreleasepool { RestoreOrMinimize(); } });
                 }
                 return NULL;
             case kVK_LeftArrow:
-                if (down) {
-                    TileTo(0.0, 0.5);
+                if (down && !repeat) {
+                    dispatch_async(winQueue, ^{ @autoreleasepool { TileTo(0.0, 0.5); } });
                 }
                 return NULL;
             case kVK_RightArrow:
-                if (down) {
-                    TileTo(0.5, 0.5);
+                if (down && !repeat) {
+                    dispatch_async(winQueue, ^{ @autoreleasepool { TileTo(0.5, 0.5); } });
                 }
                 return NULL;
             case kVK_ANSI_E:
@@ -574,6 +700,7 @@ int main(const int argc, char* * const argv) {
         }
 
         eventSrc = CGEventSourceCreate(kCGEventSourceStateHIDSystemState);
+        winQueue = dispatch_queue_create("mocsd.window", DISPATCH_QUEUE_SERIAL);
 
         const CGEventMask mask = CGEventMaskBit(kCGEventKeyDown) | CGEventMaskBit(kCGEventKeyUp) | CGEventMaskBit(kCGEventLeftMouseDown) | CGEventMaskBit(kCGEventLeftMouseUp) | CGEventMaskBit(kCGEventLeftMouseDragged);
 
