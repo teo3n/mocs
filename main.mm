@@ -7,6 +7,8 @@
 static const int64_t SYNTHETIC_MARKER = 0xC0DECAFE;
 static const bool EXPERIMENTAL_CMD2CTRL = true;
 static const float AX_MESSAGE_TIMEOUT = 1.0f;
+static const CGFloat DRAG_TILE_EDGE_MARGIN = 32.0;
+static const CGFloat DRAG_TILE_MIN_DISTANCE = 8.0;
 
 // <IOKit/hidsystem/IOLLEvent.h> as NX_DEVICE* KEYMASK.
 static const uint64_t LCTRL_MASK = 0x00000001;
@@ -24,9 +26,17 @@ static dispatch_queue_t winQueue = NULL;
 
 // meta+drag
 static bool isDragging = false;
+static bool dragDidMove = false;
 static AXUIElementRef dragWin = NULL;
 static CGPoint dragStartMouse;
 static CGPoint dragStartWinPos;
+
+typedef enum {
+    DragTileNone = 0,
+    DragTileFill,
+    DragTileLeft,
+    DragTileRight,
+} DragTileAction;
 
 static void PostKey(const CGKeyCode k, const CGEventFlags flags) {
     const CGEventRef d = CGEventCreateKeyboardEvent(eventSrc, k, true);
@@ -219,11 +229,50 @@ static bool SetWinFrame(const AXUIElementRef win, const CGRect rect) {
     return posErr == kAXErrorSuccess && (sizeErr1 == kAXErrorSuccess || sizeErr2 == kAXErrorSuccess);
 }
 
+static CGRect AxFullFrameForScreen(NSScreen* const screen) {
+    const NSRect frame = [screen frame];
+    const CGFloat ph = NSMaxY([[NSScreen screens][0] frame]);
+
+    return CGRectMake(frame.origin.x, ph - (frame.origin.y + frame.size.height), frame.size.width, frame.size.height);
+}
+
 static CGRect AxFrameForScreen(NSScreen* const screen) {
     const NSRect vis = [screen visibleFrame];
     const CGFloat ph = NSMaxY([[NSScreen screens][0] frame]);
 
     return CGRectMake(vis.origin.x, ph - (vis.origin.y + vis.size.height), vis.size.width, vis.size.height);
+}
+
+static NSPoint NSPointFromAXPoint(const CGPoint point) {
+    const CGFloat ph = NSMaxY([[NSScreen screens][0] frame]);
+    return NSMakePoint(point.x, ph - point.y);
+}
+
+static CGFloat DistanceToRect(const NSPoint point, const NSRect rect) {
+    const CGFloat dx = (point.x < NSMinX(rect)) ? NSMinX(rect) - point.x : ((point.x > NSMaxX(rect)) ? point.x - NSMaxX(rect) : 0.0);
+    const CGFloat dy = (point.y < NSMinY(rect)) ? NSMinY(rect) - point.y : ((point.y > NSMaxY(rect)) ? point.y - NSMaxY(rect) : 0.0);
+    return dx*dx + dy*dy;
+}
+
+static NSScreen* ScreenForPoint(const CGPoint point) {
+    const NSPoint ns = NSPointFromAXPoint(point);
+    NSScreen* best = [NSScreen mainScreen];
+    CGFloat bestDist = CGFLOAT_MAX;
+
+    for (NSScreen* screen in [NSScreen screens]) {
+        const NSRect frame = [screen frame];
+        if (NSPointInRect(ns, frame)) {
+            return screen;
+        }
+
+        const CGFloat dist = DistanceToRect(ns, frame);
+        if (dist < bestDist) {
+            best = screen;
+            bestDist = dist;
+        }
+    }
+
+    return best;
 }
 
 static NSScreen* ScreenForWindow(const AXUIElementRef win) {
@@ -232,17 +281,7 @@ static NSScreen* ScreenForWindow(const AXUIElementRef win) {
         return [NSScreen mainScreen];
     }
 
-    const CGPoint point = CGPointMake(CGRectGetMidX(rect), CGRectGetMidY(rect));
-    const CGFloat ph = NSMaxY([[NSScreen screens][0] frame]);
-    const NSPoint ns = NSMakePoint(point.x, ph - point.y);
-
-    for (NSScreen* screen in [NSScreen screens]) {
-        if (NSPointInRect(ns, [screen frame])) {
-            return screen;
-        }
-    }
-
-    return [NSScreen mainScreen];
+    return ScreenForPoint(CGPointMake(CGRectGetMidX(rect), CGRectGetMidY(rect)));
 }
 
 static CGRect DefaultFrameForScreen(NSScreen* const screen) {
@@ -263,19 +302,65 @@ static bool IsFilled(const AXUIElementRef win) {
     return fabs(rect.origin.y - sf.origin.y) < 20 && fabs(rect.size.height - sf.size.height) < 20;
 }
 
+static CGRect TileFrameForScreen(NSScreen* const screen, const CGFloat fracX, const CGFloat fracW) {
+    CGRect rect = AxFrameForScreen(screen);
+    const CGFloat newW = floor(rect.size.width*  fracW);
+
+    rect.origin.x += floor(rect.size.width*  fracX);
+    rect.size.width = newW;
+
+    return rect;
+}
+
+static DragTileAction DragTileActionForPoint(const CGPoint point, NSScreen** const outScreen) {
+    NSScreen* const screen = ScreenForPoint(point);
+    if (outScreen) {
+        *outScreen = screen;
+    }
+
+    const CGRect full = AxFullFrameForScreen(screen);
+    const CGRect vis = AxFrameForScreen(screen);
+    const CGFloat margin = DRAG_TILE_EDGE_MARGIN;
+
+    const bool nearTop = point.y <= CGRectGetMinY(full) + margin || point.y <= CGRectGetMinY(vis) + margin;
+    const bool nearLeft = point.x <= CGRectGetMinX(full) + margin || point.x <= CGRectGetMinX(vis) + margin;
+    const bool nearRight = point.x >= CGRectGetMaxX(full) - margin || point.x >= CGRectGetMaxX(vis) - margin;
+
+    if (nearTop) {
+        return DragTileFill;
+    }
+    if (nearLeft) {
+        return DragTileLeft;
+    }
+    if (nearRight) {
+        return DragTileRight;
+    }
+
+    return DragTileNone;
+}
+
+static CGRect DragTileFrameForScreen(NSScreen* const screen, const DragTileAction action) {
+    switch (action) {
+        case DragTileFill:
+            return AxFrameForScreen(screen);
+        case DragTileLeft:
+            return TileFrameForScreen(screen, 0.0, 0.5);
+        case DragTileRight:
+            return TileFrameForScreen(screen, 0.5, 0.5);
+        case DragTileNone:
+            return CGRectZero;
+    }
+
+    return CGRectZero;
+}
+
 static void TileTo(const CGFloat fracX, const CGFloat fracW) {
     const AXUIElementRef win = FocusedWindow();
     if (!win) {
         return;
     }
 
-    CGRect rect = AxFrameForScreen(ScreenForWindow(win));
-    const CGFloat newW = floor(rect.size.width*  fracW);
-
-    rect.origin.x += floor(rect.size.width*  fracX);
-    rect.size.width = newW;
-    
-    SetWinFrame(win, rect);
+    SetWinFrame(win, TileFrameForScreen(ScreenForWindow(win), fracX, fracW));
     CFRelease(win);
 }
 
@@ -459,6 +544,7 @@ static CGEventRef Handler(const CGEventTapProxy proxy, const CGEventType type, c
                 }
 
                 isDragging = true;
+                dragDidMove = false;
                 dragWin = win;
                 dragStartMouse = loc;
                 dragStartWinPos = rect.origin;
@@ -473,7 +559,14 @@ static CGEventRef Handler(const CGEventTapProxy proxy, const CGEventType type, c
     if (isDragging) {
         if (type == kCGEventLeftMouseDragged) {
             const CGPoint loc = CGEventGetLocation(event);
-            const CGPoint pp = CGPointMake(dragStartWinPos.x + (loc.x - dragStartMouse.x), dragStartWinPos.y + (loc.y - dragStartMouse.y));
+            const CGFloat dx = loc.x - dragStartMouse.x;
+            const CGFloat dy = loc.y - dragStartMouse.y;
+
+            if ((dx*  dx + dy*  dy) >= (DRAG_TILE_MIN_DISTANCE*  DRAG_TILE_MIN_DISTANCE)) {
+                dragDidMove = true;
+            }
+
+            const CGPoint pp = CGPointMake(dragStartWinPos.x + dx, dragStartWinPos.y + dy);
             const AXValueRef pv = AXValueCreate(kAXValueTypeCGPoint, &pp);
             AXUIElementSetAttributeValue(dragWin, kAXPositionAttribute, pv);
             CFRelease(pv);
@@ -482,9 +575,31 @@ static CGEventRef Handler(const CGEventTapProxy proxy, const CGEventType type, c
         }
 
         if (type == kCGEventLeftMouseUp) {
+            const CGPoint loc = CGEventGetLocation(event);
+            const CGFloat dx = loc.x - dragStartMouse.x;
+            const CGFloat dy = loc.y - dragStartMouse.y;
+            const bool shouldTile = dragDidMove || (dx*dx + dy*dy) >= (DRAG_TILE_MIN_DISTANCE*DRAG_TILE_MIN_DISTANCE);
+            AXUIElementRef win = dragWin;
+
             isDragging = false;
-            CFRelease(dragWin);
+            dragDidMove = false;
             dragWin = NULL;
+
+            if (shouldTile && win) {
+                NSScreen* screen = nil;
+                const DragTileAction tileAction = DragTileActionForPoint(loc, &screen);
+                if (tileAction != DragTileNone) {
+                    const CGRect target = DragTileFrameForScreen(screen, tileAction);
+                    dispatch_async(winQueue, ^{ @autoreleasepool {
+                        SetWinFrame(win, target);
+                        CFRelease(win);
+                    } });
+                } else {
+                    CFRelease(win);
+                }
+            } else if (win) {
+                CFRelease(win);
+            }
 
             return NULL;
         }
